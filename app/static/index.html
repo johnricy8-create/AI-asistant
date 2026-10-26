@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>优选商城 · 智能客服 Copilot</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">优</div>
+          <div class="brand-text">
+            <h1>优选商城 <span>智能客服 Copilot</span></h1>
+            <p>FAQ · RAG · 订单物流 · 人工兜底</p>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <div class="model-pill" id="model-pill" title="模型状态">
+            <span class="status-dot" id="model-dot"></span>
+            <span id="model-label">正在连接…</span>
+          </div>
+          <label class="auto-toggle" title="开启后，P3 低优先级问题由模型直接回复">
+            <input type="checkbox" id="auto-reply-toggle" checked />
+            <span class="auto-toggle-track"><span class="auto-toggle-thumb"></span></span>
+            <span class="auto-toggle-label">低优先自动回复</span>
+          </label>
+          <button class="ghost-btn" id="reset-btn" type="button">重置演示</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="panel conversation-panel">
+          <div class="panel-head">
+            <div class="customer">
+              <div class="avatar">王</div>
+              <div>
+                <h2>小王 <span class="member-tag">黄金会员</span></h2>
+                <p id="customer-subtitle">订单咨询 · 会话已接入</p>
+              </div>
+            </div>
+            <select id="order-select" class="order-select" aria-label="选择订单"></select>
+          </div>
+
+          <div class="messages" id="messages"></div>
+
+          <div class="composer">
+            <div class="chips" id="scenario-chips"></div>
+            <div class="input-row">
+              <textarea
+                id="message-input"
+                rows="2"
+                placeholder="输入顾客问题，Ctrl + Enter 发送"
+              ></textarea>
+              <button class="send-btn" id="send-btn" type="button" title="发送">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3.4 20.6 21 12 3.4 3.4l.1 6.7L15 12 3.5 13.9z" />
+                </svg>
+              </button>
+            </div>
+            <div class="composer-hint">演示数据 · 所有订单与顾客均为虚构</div>
+          </div>
+        </section>
+
+        <section class="panel suggestion-panel">
+          <div class="panel-head">
+            <div>
+              <h2>AI 建议</h2>
+              <p>给客服的副驾话术，人工核对后发送</p>
+            </div>
+            <span class="channel-badge" id="channel-badge">等待提问</span>
+          </div>
+
+          <div class="suggestion-empty" id="suggestion-empty">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3a7 7 0 0 0-7 7v3.2L3.6 17a1 1 0 0 0 .9 1.4h15a1 1 0 0 0 .9-1.4L19 13.2V10a7 7 0 0 0-7-7z" />
+                <path d="M9.5 20a2.5 2.5 0 0 0 5 0" />
+              </svg>
+            </div>
+            <h3>发送一条顾客问题</h3>
+            <p>AI 会在这里给出建议话术、引用来源、风险提示和完整决策链路。</p>
+          </div>
+
+          <div class="suggestion-body hidden" id="suggestion-body">
+            <div class="handoff-banner hidden" id="handoff-banner"></div>
+            <div class="degraded-banner hidden" id="degraded-banner"></div>
+
+            <div class="priority-strip" id="priority-strip">
+              <span class="priority-badge" id="priority-badge">--</span>
+              <span class="priority-handling" id="priority-handling">--</span>
+              <span class="priority-reason" id="priority-reason"></span>
+            </div>
+
+            <div class="meta-row">
+              <div class="confidence">
+                <div class="confidence-top">
+                  <span>置信度</span>
+                  <strong id="confidence-value">--</strong>
+                </div>
+                <div class="confidence-bar"><span id="confidence-bar"></span></div>
+              </div>
+              <div class="latency" id="latency-value">-- ms</div>
+            </div>
+
+            <div class="section-label">
+              建议话术
+              <span class="ai-disclaimer">AI 生成，请核对</span>
+            </div>
+            <textarea class="draft" id="draft-text" rows="6"></textarea>
+
+            <div class="draft-actions">
+              <button class="primary-btn" id="adopt-btn" type="button">采用并发送</button>
+              <button class="secondary-btn" id="regenerate-btn" type="button">换一个</button>
+              <button class="danger-btn" id="handoff-btn" type="button">转人工</button>
+            </div>
+
+            <div class="section-label">参考来源</div>
+            <div class="citations" id="citations"></div>
+
+            <div class="section-label">建议动作</div>
+            <div class="actions" id="actions"></div>
+
+            <div class="section-label">风险提示</div>
+            <div class="risk-flags" id="risk-flags"></div>
+
+            <div class="feedback-row">
+              <span>这条建议有帮助吗？</span>
+              <button class="feedback-btn" data-feedback="helpful" type="button">有用</button>
+              <button class="feedback-btn" data-feedback="not_helpful" type="button">无用</button>
+              <button class="feedback-btn" data-feedback="wrong" type="button">答错了</button>
+              <button class="feedback-btn" data-feedback="policy_outdated" type="button">政策过期</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel trace-panel">
+          <div class="panel-head">
+            <div>
+              <h2>决策追踪</h2>
+              <p>路由、检索、工具调用与风控</p>
+            </div>
+            <span class="trace-latency" id="trace-latency">--</span>
+          </div>
+          <div class="trace-body" id="trace-body">
+            <div class="trace-empty">发送问题后展示完整链路</div>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <script src="/static/app.js?v=12"></script>
+  </body>
+</html>
