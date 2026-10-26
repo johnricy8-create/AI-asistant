@@ -5,8 +5,11 @@
 - 设计文档：`技术设计方案_RAG智能客服_v1.md`
 - 业务原型：`02_智能客服.md`
 - 当前形态：**优先级分流 + Copilot**（P3 低优先自动回复；P1/P0 兜底并转人工）
-- 模型：**智谱 GLM-4.7-Flash**（公有 API，关闭思考模式以降低延迟和成本）
-- 技术栈：Python 3.12 + FastAPI + SQLite（Demo）+ 本地混合检索
+- 生成模型：**智谱 GLM-4.7-Flash**（公有 API，关闭思考模式）
+- 向量模型：**硅基流动 BAAI/bge-m3**（1024 维，Sentence Transformers 兼容模型）
+- 重排模型：**硅基流动 BAAI/bge-reranker-v2-m3**（cross-encoder）
+- 向量库：**ChromaDB**
+- 技术栈：Python 3.12 + FastAPI + SQLite + ChromaDB + SiliconFlow
 
 ---
 
@@ -21,17 +24,20 @@
 | 类目兜底 | 商品质量/资金差价/大额订单/物流/发票/地址/投诉分别配置话术与技能组 |
 | 高风险兜底 | 退款/差价/商品质量/大额订单/投诉 → 类目兜底话术 + 转人工 |
 | 合规话术 | 委婉表达、不承诺一定退款/赔偿、说明“具体以平台规则和审核结果为准” |
+| 文本切块 | 按 `\n\n` 切分，不限制字数；种子知识库 12 文档 → 36 块 |
 | FAQ 秒回 | 精确匹配 + 字符 n-gram 语义匹配 + 阈值/分差双重门槛 |
-| RAG 检索 | BM25 + 字符 bigram + 关键词 + 标题相似度 + 轻量重排 |
+| 向量检索 | ChromaDB + SiliconFlow `BAAI/bge-m3`，召回 15 条 |
+| 模型重排 | SiliconFlow `BAAI/bge-reranker-v2-m3` cross-encoder，重排到 5 条 |
+| 检索降级 | Chroma/SiliconFlow 不可用时，自动回退 BM25 + 字符 n-gram 词法检索 |
 | 订单/物流查询 | 只读 Mock API：订单状态、物流、退款进度 |
 | 上下文改写 | 多轮追问时补全“这个/那/定金”等指代 |
 | 风险预检 | 退款、退差价、投诉、改地址、取消订单等涉敏动作转人工 |
 | 引用来源 | 每条建议展示知识库标题、条款、分数、摘要 |
-| 决策追踪 | 展示规范化、风控、路由、优先级、FAQ、检索、Tool、生成、输出风控 |
+| 决策追踪 | 展示规范化、风控、路由、优先级、FAQ、召回、重排、Tool、生成、输出风控 |
 | 转人工上下文包 | 摘要、订单快照、引用、草稿、风险标签、技能组、优先级 |
 | 反馈闭环 | 采用 / 编辑 / 有用 / 无用 / 答错 / 政策过期 |
 | 降级 | 模型限流/失败自动降级为本地模板，并在界面标记 |
-| 评测 | 24 条 pytest 覆盖四通道、优先级、自动回复、类目兜底、接待语、合规话术、多轮、反馈、转人工 |
+| 评测 | 28 条 pytest 覆盖四通道、优先级、自动回复、类目兜底、接待语、合规话术、切块、多轮、反馈、转人工 |
 
 ---
 
@@ -39,16 +45,30 @@
 
 ### 2.1 安装依赖
 
-项目使用 `uv` 管理 Python 环境（本机已安装）：
+项目有两套环境：
+
+**① 项目基础环境（测试、词法回退）**
 
 ```powershell
 cd D:\AI客服
 uv sync
 ```
 
+**② 向量环境 `D:\pytorch\.venv`（ChromaDB + SiliconFlow）**
+
+```powershell
+uv venv --python 3.12 D:\pytorch\.venv
+
+uv pip install --python D:\pytorch\.venv\Scripts\python.exe `
+  fastapi "uvicorn[standard]" pydantic pydantic-settings httpx sqlalchemy `
+  python-dotenv chromadb sentence-transformers pytest
+```
+
+`run_demo.bat` 会优先使用 `D:\pytorch\.venv`；如果找不到，会回退到项目 `.venv` 的词法检索模式。
+
 ### 2.2 配置模型
 
-复制 `.env.example` 为 `.env`，填入智谱 API Key：
+复制 `.env.example` 为 `.env`：
 
 ```powershell
 Copy-Item .env.example .env
@@ -71,23 +91,58 @@ ZHIPU_COOLDOWN_SECONDS=20
 PRIORITY_TOTAL_TIMEOUT_SECONDS=3
 PRIORITY_LARGE_AMOUNT_THRESHOLD=500
 LLM_MODE=zhipu
+
+SILICONFLOW_API_KEY=你的硅基流动APIKey
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_EMBEDDING_MODEL=BAAI/bge-m3
+SILICONFLOW_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+EMBEDDING_PROVIDER=siliconflow
+RERANK_PROVIDER=siliconflow
+
+RETRIEVAL_BACKEND=chroma
+CHROMA_PATH=./data/chroma
+CHROMA_COLLECTION=kb_chunks
+RECALL_TOP_K=15
+RERANK_TOP_K=5
+CONTEXT_TOP_K=5
+RERANK_MIN_SCORE=0.10
 ```
 
 说明：
 
-- `ZHIPU_DISABLE_THINKING=true`：GLM-4.7-Flash 是推理模型，客服话术不需要思维链；关闭后可避免 token 全被 `reasoning_content` 占用。
-- `ZHIPU_TOTAL_TIMEOUT_SECONDS=8`：单次生成的总时间预算；超时或遇到 429/5xx 会降级为本地模板，避免页面长时间等待。
-- `ZHIPU_COOLDOWN_SECONDS=20`：触发限流/超时后，20 秒内直接使用本地模板，避免连续重试放大延迟。
-- `PRIORITY_TOTAL_TIMEOUT_SECONDS=3`：优先级分类的独立时间预算；超时则使用规则分级，不阻塞主链路。
-- `PRIORITY_LARGE_AMOUNT_THRESHOLD=500`：大额订单阈值；金额达到阈值且涉及售后/退款/商品/投诉时，至少 P1 并走兜底。
-- `LLM_MODE=zhipu`：强制调用智谱；失败会自动降级为本地模板。
-- 不想调用 API 时，把 `LLM_MODE` 改成 `mock`，Demo 仍可完整运行。
-- `.env` 已在 `.gitignore` 中，不会进入版本库。
+- `EMBEDDING_PROVIDER=siliconflow`：使用硅基流动 `BAAI/bge-m3`，1024 维，不占用本地显存。
+- `RERANK_PROVIDER=siliconflow`：使用硅基流动 `BAAI/bge-reranker-v2-m3` cross-encoder。
+- `RETRIEVAL_BACKEND=chroma`：使用 ChromaDB；`auto` 会自动尝试 Chroma，失败回退词法；`lexical` 强制 BM25。
+- `RECALL_TOP_K=15` / `RERANK_TOP_K=5`：召回 15 条，模型重排后保留 5 条。
+- `SILICONFLOW_API_KEY` 只放在 `.env`，不会进入版本库。
+- 本地 Sentence Transformers 可选：把 `EMBEDDING_PROVIDER` / `RERANK_PROVIDER` 改成 `local`；当前 `transformers 5.20.2` + BGE 小模型存在兼容问题，默认走 SiliconFlow。
+- 智谱限流时仍会自动降级为本地模板，不影响主链路。
 
 ### 2.3 启动
 
+推荐双击：
+
 ```powershell
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+.\run_demo.bat
+```
+
+或手动用向量环境启动：
+
+```powershell
+cd D:\AI客服
+D:\pytorch\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+健康检查会显示当前检索后端：
+
+```text
+http://127.0.0.1:8000/api/v1/health
 ```
 
 或双击/运行：
@@ -167,13 +222,38 @@ http://127.0.0.1:8000
    └─ P0 紧急：直接转人工 + 上下文包
         │
         ▼
+   RAG 通道（知识问）
+   ├─ 切块：按 \n\n 切分，不限制字数
+   ├─ 向量化：SiliconFlow BAAI/bge-m3（1024 维）
+   ├─ 向量库：ChromaDB（cosine）
+   ├─ 召回：15 条
+   ├─ 重排：SiliconFlow BAAI/bge-reranker-v2-m3 → 5 条
+   └─ 生成：Top 5 + 订单快照 + 历史 → GLM
+        │
+        ▼
    输出风控 → 建议话术 / 引用 / 风险提示
         │
         ▼
    Copilot 工作台（自动回复 / 采用 / 编辑 / 换一个 / 转人工）
 ```
 
-### 4.1 优先级与兜底策略
+### 4.1 RAG 检索链路
+
+| 环节 | 当前实现 |
+|---|---|
+| 文本切块 | 按 `\n\n` 切分，不限制字数；种子知识库 12 文档 → 36 块 |
+| Embedding | SiliconFlow `BAAI/bge-m3`，1024 维 |
+| 向量库 | ChromaDB，cosine 距离，持久化到 `data/chroma` |
+| 召回 | `RECALL_TOP_K=15` |
+| Rerank | SiliconFlow `BAAI/bge-reranker-v2-m3` cross-encoder，保留 5 条 |
+| 生成上下文 | 重排 Top 5 + 订单快照 + 最近会话 |
+| 生成 | 智谱 GLM-4.7-Flash；失败/限流时用抽取式模板 |
+| 降级 | Chroma/SiliconFlow 不可用 → BM25 + 字符 n-gram 词法检索 |
+| 引用 | 返回重排后的标题、章节、分数、摘要 |
+
+> 首次启动会用 SiliconFlow 对 36 个块做一次 Embedding 并写入 Chroma；之后通过 manifest 复用，不会重复向量化。
+
+### 4.2 优先级与兜底策略
 
 | 优先级 | 典型问题 | 默认处理 | 是否自动回复 |
 |---|---|---|---|
@@ -249,10 +329,16 @@ app/
   orchestration/session.py   # 会话状态（Demo 用内存）
   orchestration/orchestrator.py  # 主链路编排、Trace、Handoff
   rag/faq.py                 # FAQ 匹配
-  rag/index.py               # BM25 + 字符 n-gram 混合检索
+  rag/chunking.py            # 按 \n\n 切块，不限制字数
+  rag/chroma_store.py        # ChromaDB 持久化、召回、词法回退
+  rag/embeddings.py          # SiliconFlow BGE-M3 / 本地 Sentence Transformers
+  rag/rerank.py              # SiliconFlow / 本地 BGE reranker
+  rag/factory.py             # 按配置组装 Retriever + Reranker
+  rag/index.py               # BM25 + 字符 n-gram 词法回退
   rag/generator.py           # GLM-4.7-Flash 调用 + 本地降级模板
   static/                    # Copilot 工作台前端
-tests/test_pipeline.py       # 18 条端到端测试
+tests/test_pipeline.py       # 24 条端到端测试
+tests/test_chunking.py       # 4 条切块测试
 scripts/                     # 模型连通性、检索、Live 链路调试脚本
 ```
 
@@ -289,7 +375,7 @@ scripts/                     # 模型连通性、检索、Live 链路调试脚�
 - `suggested_actions`：建议动作
 - `risk_flags`：风险标记（含商品质量、大额订单、资金风险等）
 - `order_snapshot`：订单快照
-- `trace`：决策链路（含优先级判定）
+- `trace`：决策链路（含自动接待、优先级审核、Chroma 召回 15、BGE 重排 5）
 - `handoff`：转人工上下文包
 - `debug`：FAQ 分数、检索命中、Tool 结果、优先级、模型模式
 
@@ -299,13 +385,26 @@ scripts/                     # 模型连通性、检索、Live 链路调试脚�
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/v1/health` | 健康检查、模型模式、FAQ/KB 数量 |
+| GET | `/api/v1/health` | 健康检查、模型模式、检索后端、Embedding/Reranker、召回数量 |
 | GET | `/api/v1/demo/scenarios` | Demo 场景 |
 | GET | `/api/v1/demo/orders` | Mock 订单列表 |
 | POST | `/api/v1/demo/seed` | 预置多轮会话 |
 | POST | `/api/v1/demo/reset` | 重置 Demo 会话 |
 | POST | `/api/v1/feedback` | 采用/编辑/有用/无用/答错/政策过期 |
 | POST | `/api/v1/handoff` | 创建转人工工单 |
+
+`/api/v1/health` 会返回类似：
+
+```json
+{
+  "retrieval_backend": "ChromaDB + SiliconFlow/BAAI/bge-m3",
+  "embedding_model": "SiliconFlow/BAAI/bge-m3",
+  "reranker": "SiliconFlow/BAAI/bge-reranker-v2-m3",
+  "rerank_active": true,
+  "recall_top_k": 15,
+  "rerank_top_k": 5
+}
+```
 
 Swagger：
 
@@ -325,6 +424,8 @@ uv run pytest
 
 - FAQ 命中
 - RAG 长尾检索与引用
+- 按 `\n\n` 切块，不限制字数
+- 种子文档 12 篇 → 36 块
 - 订单 Tool 查询
 - 退款进度 Tool 查询
 - 退差价转人工 + 上下文包
@@ -346,6 +447,8 @@ uv run pytest
 - 大模型可以为 P1 纯规则问题决定 need_human
 - 大模型可以拒绝 P3 自动回复
 
+> 测试使用项目 `.venv` + `RETRIEVAL_BACKEND=lexical`，不依赖 ChromaDB/SiliconFlow，保证离线可跑。真实 Chroma + SiliconFlow 链路用 `scripts/test_chroma_live.py` 验证。
+
 ---
 
 ## 7. 当前实现与生产方案的差异
@@ -355,17 +458,19 @@ uv run pytest
 | 优先级分流 | 关键词规则 + GLM 分级（P2/P3） | 可配置规则引擎 + 微调分类模型 + 人工抽检 |
 | 低优先自动回复 | P3 且置信度 ≥ 0.6 自动回复 | 按类目灰度、按渠道灰度、可一键熔断 |
 | 高风险兜底 | 模板兜底 + 转人工 | 资金/商品/大额专用兜底话术 + 工单联动 |
-| 向量检索 | BM25 + 字符 n-gram + 关键词 | Milvus 2.5 + BGE-M3 dense/sparse + RRF |
-| 重排 | 轻量启发式 | BGE-reranker-v2-m3 cross-encoder |
+| 文本切块 | 按 `\n\n` 切分，不限制字数 | 结构化父子块 + 表格/条款/生效期处理 |
+| 向量检索 | ChromaDB + SiliconFlow BGE-M3，召回 15 | Milvus 2.5 + BGE-M3 dense/sparse + RRF |
+| 重排 | SiliconFlow BGE-reranker-v2-m3，保留 5 | 自托管 BGE-reranker-v2-m3 + 业务特征微调 |
+| 检索降级 | Chroma/SiliconFlow 失败 → BM25 + 字符 n-gram | 多级降级 + 熔断 + 缓存 |
 | 数据库 | SQLite | MySQL 8.0 |
 | 会话 | 内存 | Redis + MySQL 持久化 |
 | FAQ 缓存 | 内存/无 | Redis 精确缓存 + 版本失效 |
-| 文档入库 | 代码内种子数据 | MinerU/PyMuPDF/PaddleOCR + 版本/生效期/蓝绿索引 |
+| 文档入库 | 代码内种子数据，按 `\n\n` 重建切块 | MinerU/PyMuPDF/PaddleOCR + 版本/生效期/蓝绿索引 |
 | 订单接口 | Mock 函数 | 真实只读 OpenAPI，超时/熔断/最小权限 |
 | 鉴权 | 无 | JWT/OAuth2 + RBAC + WAF + 限流 |
 | 流式输出 | 否 | SSE 流式首 token |
 | 观测 | Trace 面板 + SQLite | OpenTelemetry + Langfuse + Prometheus/Grafana |
-| 评测 | 24 条 pytest | 500–1000 条金标集 + Ragas/DeepEval + CI 门禁 |
+| 评测 | 28 条 pytest | 500–1000 条金标集 + Ragas/DeepEval + CI 门禁 |
 
 > 详细的生产化设计见 `技术设计方案_RAG智能客服_v1.md`。
 
@@ -375,7 +480,10 @@ uv run pytest
 
 - 当前是**优先级分流 Demo**：P3 低优先可自动回复；P1/P0 兜底并等待人工确认；所有写操作仍是只读/人工。
 - 订单/物流/退款是 **Mock 只读数据**，不会执行任何真实写操作。
-- FAQ/检索为本地轻量实现，未接 Milvus/BGE-M3；适合验证业务链路，不适合直接上生产。
+- 当前知识库是 12 篇种子文档、36 个块；切块规则是简单的 `\n\n`，没有 PDF/Word 上传、表格解析、父子块展开和生效期治理。
+- ChromaDB 当前是单机持久化模式，适合 Demo/中小知识库；百万级块或高并发生产建议换 Milvus。
+- 向量化和重排默认调用硅基流动 API，需要网络和 API 额度；API 不可用时会回退到 BM25 词法检索。
+- 本地 Sentence Transformers 已安装并可加载 reranker，但 `transformers 5.20.2` 下 BGE 小模型 embedding 存在兼容问题；默认走 SiliconFlow。
 - 优先级规则是 Demo 级关键词/正则规则，生产环境应改为可配置规则引擎，并用真实工单做分类器评测。
 - 优先级分类默认 3 秒超时；超时或模型不可用时自动使用规则分级。
 - P3 的 `auto_reply`、P1/P2 的 `need_human` 在模型可用时由 GLM 决定；强制兜底关键词、商品问题、大额订单、资金写操作、投诉不调用模型做降级判断。
@@ -383,17 +491,18 @@ uv run pytest
 - 合规/法务措辞是 Demo 级参考，正式上线前需由法务按平台规则、类目和地区复核。
 - 未做登录、权限、限流、审计留存策略；不要直接暴露到公网。
 - GLM-4.7-Flash 高峰期可能返回 1305 限流；代码已做总超时（默认 8s）、重试、冷却和模板降级，界面会用黄色提示条标记“本次已使用本地模板”。
-- 当前 `.env` 已配置本地 Key；请勿提交到代码仓库。如果 Key 曾公开分享，建议在智谱控制台轮换。
-- API Key 只应放在本地 `.env` 或密钥管理服务中，不要提交到代码仓库。
+- `.env` 里的智谱 Key 和硅基流动 Key 都不会进入版本库；如果 Key 曾公开分享，建议在对应控制台轮换。
 
 ---
 
 ## 9. 建议的下一步
 
-1. 用真实订单/物流/售后只读 API 替换 `app/data/orders.py`。
-2. 把 FAQ/KB 检索切到 Milvus + BGE-M3 + BGE-reranker。
-3. 增加 Redis 会话与 FAQ 缓存，补流式 SSE。
-4. 建 500–1000 条金标集，接入 Ragas/DeepEval 回归门禁。
-5. 接客服工作台真实工单系统，打通“采用/编辑/转人工”回写。
-6. 增加登录、RBAC、限流、PII 脱敏与审计留存。
-7. 生产环境评估生成式 AI 服务备案、算法备案与内容标识要求。
+1. 增加 Word/PDF/网页上传与解析，统一按 `\n\n` 切块，并补版本、生效期、owner、蓝绿索引。
+2. 建 200–500 条金标集，评测 Recall@15、rerank Top5 命中率、忠实度和端到端延迟。
+3. 知识库超过 10 万块或 QPS 上来后，把 ChromaDB 迁移到 Milvus 2.5（dense+sparse 原生混合）。
+4. 修复本地 Sentence Transformers 兼容性（固定 `transformers` 版本或换兼容的 BGE 模型），减少对 SiliconFlow API 的依赖。
+5. 用真实订单/物流/售后只读 API 替换 `app/data/orders.py`。
+6. 增加 Redis 会话与 FAQ 缓存，补流式 SSE。
+7. 接客服工作台真实工单系统，打通“采用/编辑/转人工”回写。
+8. 增加登录、RBAC、限流、PII 脱敏与审计留存。
+9. 生产环境评估生成式 AI 服务备案、算法备案与内容标识要求。

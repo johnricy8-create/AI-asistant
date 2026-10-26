@@ -1338,6 +1338,25 @@ AND confidence >= 0.6
 - 对“商品问题被误判为 P3”“大额订单被自动回复”“差价问题被自动回复”做红队测试和线上强告警。
 - 自动回复先按类目/渠道灰度，保留一键熔断和人工接管。
 
+### 15.9 v1.4 实现落地：ChromaDB + BGE-M3 + BGE reranker
+
+当前 Demo 已把检索底座替换为真实向量检索：
+
+| 环节 | 实现 |
+|---|---|
+| 切块 | 按 `\n\n` 切分，**不限制字数**；种子 12 文档 → 36 块 |
+| Embedding | 硅基流动 `BAAI/bge-m3`，1024 维 |
+| 向量库 | ChromaDB `PersistentClient`，cosine，`data/chroma` |
+| 召回 | `RECALL_TOP_K=15` |
+| Rerank | 硅基流动 `BAAI/bge-reranker-v2-m3` cross-encoder，保留 5 条 |
+| 生成 | 重排 Top 5 + 订单快照 + 历史 → GLM-4.7-Flash |
+| 降级 | Chroma/SiliconFlow 失败 → BM25 + 字符 n-gram 词法检索 |
+| 可配置 | `RETRIEVAL_BACKEND` / `EMBEDDING_PROVIDER` / `RERANK_PROVIDER` |
+
+启动脚本优先使用 `D:\pytorch\.venv`（ChromaDB + SiliconFlow 依赖），找不到时回退项目 `.venv` 的词法检索。
+
+> 本地 Sentence Transformers 也可作为 `EMBEDDING_PROVIDER=local` / `RERANK_PROVIDER=local` 的备选；当前 `transformers 5.20.2` 下 BGE 小模型 embedding 存在兼容问题，默认使用 SiliconFlow。
+
 ---
 
 ## 附录 A：术语

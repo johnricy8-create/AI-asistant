@@ -38,6 +38,13 @@ def health(request: Request) -> dict:
         "zhipu_configured": bool(settings.zhipu_api_key.strip()),
         "faq_count": len(services.faq_index.entries),
         "kb_count": len(services.retriever.chunks),
+        "retrieval_backend": getattr(services.retriever, "name", "unknown"),
+        "embedding_model": getattr(services.retriever, "embedding_model", "none"),
+        "reranker": getattr(services.reranker, "name", "None"),
+        "rerank_active": getattr(services.reranker, "active", False),
+        "recall_top_k": settings.recall_top_k,
+        "rerank_top_k": settings.rerank_top_k,
+        "siliconflow_configured": settings.siliconflow_enabled,
         "sessions": services.sessions.count(),
         "stats": services.db.stats(),
     }

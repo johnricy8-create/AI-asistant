@@ -38,6 +38,31 @@ class Settings(BaseSettings):
     max_context_chars: int = 6000
     max_history_turns: int = 6
 
+    # Retrieval / vector store
+    retrieval_backend: str = "auto"  # auto | chroma | lexical
+    chroma_path: str = "./data/chroma"
+    chroma_collection: str = "kb_chunks"
+    recall_top_k: int = 15
+    rerank_top_k: int = 5
+    context_top_k: int = 5
+    rerank_min_score: float = 0.10
+
+    # Embedding provider
+    embedding_provider: str = "auto"  # auto | siliconflow | local
+    local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_timeout_seconds: float = 30.0
+
+    # Rerank provider
+    rerank_provider: str = "auto"  # auto | siliconflow | local | none
+    local_reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_timeout_seconds: float = 30.0
+
+    # SiliconFlow (BGE-M3 embedding + BGE reranker)
+    siliconflow_api_key: str = ""
+    siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
+    siliconflow_embedding_model: str = "BAAI/bge-m3"
+    siliconflow_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
         env_file_encoding="utf-8",
@@ -48,6 +73,10 @@ class Settings(BaseSettings):
     @property
     def zhipu_enabled(self) -> bool:
         return self.llm_mode in {"auto", "zhipu"} and bool(self.zhipu_api_key.strip())
+
+    @property
+    def siliconflow_enabled(self) -> bool:
+        return bool(self.siliconflow_api_key.strip())
 
     @property
     def model_mode(self) -> str:

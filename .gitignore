@@ -6,4 +6,5 @@ __pycache__/
 data/*.db
 data/*.db-journal
 data/*.json
+data/chroma/
 .DS_Store

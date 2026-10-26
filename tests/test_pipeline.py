@@ -16,6 +16,8 @@ def client(tmp_path: Path):
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         llm_mode="mock",
+        retrieval_backend="lexical",
+        rerank_provider="none",
     )
     app = create_app(settings)
     with TestClient(app) as test_client:

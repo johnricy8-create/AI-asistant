@@ -11,13 +11,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
 from app.config import Settings, get_settings
-from app.data.seed import FAQ_SEED, KB_SEED
+from app.data.seed import FAQ_SEED
 from app.db import Database
 from app.orchestration.orchestrator import ChatOrchestrator
 from app.orchestration.session import SessionStore
+from app.rag.factory import build_reranker, build_retriever
 from app.rag.faq import FAQIndex
 from app.rag.generator import GeneratorService
-from app.rag.index import HybridRetriever
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -27,7 +27,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 class AppServices:
     settings: Settings
     faq_index: FAQIndex
-    retriever: HybridRetriever
+    retriever: object
+    reranker: object
     sessions: SessionStore
     generator: GeneratorService
     db: Database
@@ -36,7 +37,8 @@ class AppServices:
 
 def build_services(settings: Settings) -> AppServices:
     faq_index = FAQIndex(FAQ_SEED, default_margin=settings.faq_margin_default)
-    retriever = HybridRetriever(KB_SEED)
+    retriever = build_retriever(settings)
+    reranker = build_reranker(settings)
     sessions = SessionStore()
     generator = GeneratorService(settings)
     db = Database(settings.database_url)
@@ -44,6 +46,7 @@ def build_services(settings: Settings) -> AppServices:
         settings=settings,
         faq_index=faq_index,
         retriever=retriever,
+        reranker=reranker,
         sessions=sessions,
         generator=generator,
         db=db,
@@ -52,6 +55,7 @@ def build_services(settings: Settings) -> AppServices:
         settings=settings,
         faq_index=faq_index,
         retriever=retriever,
+        reranker=reranker,
         sessions=sessions,
         generator=generator,
         db=db,

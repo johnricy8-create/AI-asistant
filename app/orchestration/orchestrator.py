@@ -14,7 +14,6 @@ from app.orchestration.priority import PriorityAssessment, PriorityEngine
 from app.orchestration.session import SessionStore
 from app.rag.faq import FAQIndex, FAQMatch
 from app.rag.generator import GeneratorService
-from app.rag.index import HybridRetriever
 from app.schemas import (
     ChatDebug,
     ChatRequest,
@@ -223,7 +222,8 @@ class ChatOrchestrator:
         self,
         settings: Settings,
         faq_index: FAQIndex,
-        retriever: HybridRetriever,
+        retriever: Any,
+        reranker: Any,
         sessions: SessionStore,
         generator: GeneratorService,
         db: Database,
@@ -231,6 +231,7 @@ class ChatOrchestrator:
         self.settings = settings
         self.faq_index = faq_index
         self.retriever = retriever
+        self.reranker = reranker
         self.sessions = sessions
         self.generator = generator
         self.db = db
@@ -501,21 +502,28 @@ class ChatOrchestrator:
                 )
                 confidence = 0.0
             else:
-                hits = self.retriever.search(decision.rewritten_query, top_k=4)
+                hits = self._search_and_rerank(
+                    decision.rewritten_query,
+                    trace,
+                    top_k=self.settings.recall_top_k,
+                    rerank_top_k=self.settings.rerank_top_k,
+                )
                 top_score = hits[0]["score"] if hits else 0.0
+                min_score = (
+                    self.settings.rerank_min_score
+                    if getattr(self.reranker, "active", False)
+                    else self.settings.rag_min_score
+                )
                 trace.append(
                     TraceStep(
-                        name="retrieve",
-                        label="混合检索 + 轻量重排",
-                        status="ok" if top_score >= self.settings.rag_min_score else "warn",
+                        name="threshold",
+                        label="相关性阈值",
+                        status="ok" if top_score >= min_score else "warn",
                         latency_ms=0,
-                        detail=(
-                            f"召回 {len(hits)} 条 · 最高分 {top_score:.3f} "
-                            f"· 阈值 {self.settings.rag_min_score:.2f}"
-                        ),
+                        detail=f"最高分 {top_score:.3f} · 阈值 {min_score:.2f}",
                     )
                 )
-                if not hits or top_score < self.settings.rag_min_score:
+                if not hits or top_score < min_score:
                     channel = "human"
                     _add_flag(risk_flags, "low_confidence", "检索置信度不足", "warn")
                     priority = self._force_human_priority(priority, "检索置信度不足")
@@ -739,25 +747,76 @@ class ChatOrchestrator:
             fallback_keyword=priority.fallback_keyword,
         )
 
-    def _retrieve_policy(self, query: str, trace: list[TraceStep]) -> list[dict[str, Any]]:
+    def _search_and_rerank(
+        self,
+        query: str,
+        trace: list[TraceStep],
+        *,
+        top_k: int | None = None,
+        rerank_top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
         if not query:
             return []
+        recall_k = top_k or self.settings.recall_top_k
+        rerank_k = rerank_top_k or self.settings.rerank_top_k
+        retriever_name = getattr(self.retriever, "name", "检索")
+        reranker_name = getattr(self.reranker, "name", "重排")
+
         start = time.perf_counter()
-        hits = self.retriever.search(query, top_k=3)
+        hits = self.retriever.search(query, top_k=recall_k)
         trace.append(
             TraceStep(
                 name="retrieve",
-                label="政策检索",
+                label=f"{retriever_name} 召回",
                 status="ok" if hits else "warn",
                 latency_ms=_elapsed_ms(start),
-                detail=(
-                    f"召回 {len(hits)} 条 · 最高分 {hits[0]['score']:.3f}"
-                    if hits
-                    else "未召回"
-                ),
+                detail=f"召回 {len(hits)} 条",
             )
         )
+
+        if not hits:
+            return []
+
+        if getattr(self.reranker, "active", False):
+            rerank_start = time.perf_counter()
+            try:
+                hits = self.reranker.rerank(query, hits, top_k=rerank_k)
+                trace.append(
+                    TraceStep(
+                        name="rerank",
+                        label=f"{reranker_name} 重排",
+                        status="ok" if hits else "warn",
+                        latency_ms=_elapsed_ms(rerank_start),
+                        detail=(
+                            f"重排 {len(hits)} 条 · 最高分 {hits[0]['score']:.3f}"
+                            if hits
+                            else "重排后无结果"
+                        ),
+                    )
+                )
+            except Exception:  # noqa: BLE001 - retrieval must degrade gracefully
+                logger.exception("rerank failed; keeping retrieval order")
+                hits = hits[:rerank_k]
+                trace.append(
+                    TraceStep(
+                        name="rerank",
+                        label="重排降级",
+                        status="warn",
+                        latency_ms=_elapsed_ms(rerank_start),
+                        detail="重排失败，保留检索排序",
+                    )
+                )
+        else:
+            hits = hits[:rerank_k]
         return hits
+
+    def _retrieve_policy(self, query: str, trace: list[TraceStep]) -> list[dict[str, Any]]:
+        return self._search_and_rerank(
+            query,
+            trace,
+            top_k=self.settings.recall_top_k,
+            rerank_top_k=3,
+        )
 
     def _human_reply(self, reason_code: str | None) -> str:
         if reason_code == "low_confidence":
@@ -812,7 +871,10 @@ class ChatOrchestrator:
         if channel == "faq" and faq is not None and faq.passed:
             citations = [_citation_from_faq(faq)]
         elif hits:
-            citations = _citations_from_hits(hits)
+            citations = _citations_from_hits(
+                hits,
+                min_score=0.0 if getattr(self.reranker, "active", False) else 0.35,
+            )
 
         priority_schema = priority.to_schema() if priority else None
         handoff = None
